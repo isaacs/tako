@@ -1,19 +1,35 @@
-{ "name" : "tako"
-, "description" : "Functional web framework."
-, "tags" : ["http", "simple", "util", "utility", "web", "framework", "webframework"]
-, "version" : "0.2.4"
-, "author" : "Mikeal Rogers <mikeal.rogers@gmail.com>"
-, "repository" :
-  { "type" : "git"
-  , "url" : "http://github.com/mikeal/tako.git"
+{
+  "name": "tako",
+  "description": "Functional web framework.",
+  "tags": [
+    "http",
+    "simple",
+    "util",
+    "utility",
+    "web",
+    "framework",
+    "webframework"
+  ],
+  "version": "0.2.4",
+  "author": "Mikeal Rogers <mikeal.rogers@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "http://github.com/mikeal/tako.git"
+  },
+  "bugs": {
+    "url": "http://github.com/mikeal/tako/issues"
+  },
+  "main": "./index.html",
+  "dependencies": {
+    "filed": ">= 0.0.6",
+    "routes": "*",
+    "cookies": "~0.2.2",
+    "keygrip": "~0.2.0"
+  },
+  "devDependencies": {
+    "request": "2.9.x"
+  },
+  "scripts": {
+    "test": "node tests/run.js"
   }
-, "bugs" :
-  { "url" : "http://github.com/mikeal/tako/issues" }
-, "main" : "./index.html"
-, "dependencies": 
-  { "filed":">= 0.0.6",
-    "routes":"*"
-  }
-, "devDependencies": { "request": "2.9.x" }
-, "scripts": { "test": "node tests/run.js" }
 }

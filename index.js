@@ -16,6 +16,8 @@ var util = require('util')
   , handlebars = require('./handlebars')
   , rfc822 = require('./rfc822')
   , io = null
+  , keygrip = require('keygrip')
+  , Cookies = require('cookies')
   ;
 
 try {
@@ -262,6 +264,14 @@ function Application (options) {
   var self = this
   if (!options) options = {}
   self.options = options
+
+  if (options.keys) {
+    self.keys = new KeyGrip(options.keys)
+  }
+
+  self._plugins = {}
+  self._pluginCount = 0
+
   self.addHeaders = {}
   if (self.options.logger) {
     self.logger = self.options.logger
@@ -274,6 +284,10 @@ function Application (options) {
       return self._ioEmitter.emit('request', req, resp)
     }
     
+    if (options.cookies !== false) {
+      req.cookies = resp.cookies = new Cookies(req, resp, self.keys)
+    }
+
     for (i in self.addHeaders) {
       resp.setHeader(i, self.addHeaders[i])
     }
@@ -343,21 +357,32 @@ function Application (options) {
       self.logger.info('Response', resp.statusCode, req.url, resp._headers)
     }
 
+    // cookie support
+    req.cookies = resp.cookies = new Cookies(req, resp, keygrip)
+
+
+    cap(req)
+    // first, any 'request' listeners get a crack at things.
+    // this is enough for things that don't need to do IO, since
+    // we don't wait for them.
     self.emit('request', req, resp)
 
+    self._plug(req, resp, function () {
+      req.route.fn(req, resp)
+      req.release()
 
-    req.route.fn.call(req.route, req, resp, self.authHandler)
+      if (req.listeners('body').length) {
+        var buffer = ''
+        req.on('data', function (chunk) {
+          buffer += chunk
+        })
+        req.on('end', function (chunk) {
+          if (chunk) buffer += chunk
+          req.emit('body', buffer)
+        })
+      }
+    })
 
-    if (req.listeners('body').length) {
-      var buffer = ''
-      req.on('data', function (chunk) {
-        buffer += chunk
-      })
-      req.on('end', function (chunk) {
-        if (chunk) buffer += chunk
-        req.emit('body', buffer)
-      })
-    }
   }
 
   self.router = new routes.Router()
@@ -423,6 +448,50 @@ function Application (options) {
   }
 }
 util.inherits(Application, events.EventEmitter)
+
+// A plugin is like a 'request' event handler, except with a 'done'
+// callback.  Resume to the route handler after all plugins are finished,
+// but they do not wait for one another.
+Application.prototype.plugin = function (name, handler) {
+  if (this._plugins[name]) {
+    // XXX too forceful?
+    throw new Error('Already have a plugin named '+name)
+  }
+
+  this._plugins[name] = handler
+  this._pluginCount ++
+}
+
+Application.prototype.unplug = function (name) {
+  delete this._plugins[name]
+  this._pluginCount --
+}
+
+Application.prototype._plug = function (req, res, cb) {
+  if (this._pluginCount === 0) return cb()
+
+  var l = this._pluginCount
+    , self = this
+    ;
+
+  Object.keys(self._plugins).forEach(function (name) {
+    var plug = self._plugins[name]
+    plug(req, res, function (er) {
+      if (er) req.pluginErrors[name] = er
+      else req.pluginLoaded[name] = true
+      if (-- l === 0) return cb()
+    })
+  })
+
+}
+
+Application.prototype.auth = function (handler) {
+  this.plugin("auth", handler)
+}
+
+Application.prototype.session = function (handler) {
+  this.plugin("session", handler)
+}
 
 Application.prototype.addHeader = function (name, value) {
   this.addHeaders[name] = value
@@ -586,6 +655,8 @@ function Route (path, application) {
   self.app = application
   self.byContentType = {}
 
+
+
   var returnEarly = function (req, resp, keys, authHandler) {
     if (self._events && self._events['request']) {
       if (authHandler) {
@@ -632,107 +703,236 @@ function Route (path, application) {
       authHandler = self.authHandler
     }
 
-    var keys = Object.keys(self.byContentType).concat(['*/*'])
-    if (keys.length) {
-      if (req.method !== 'PUT' && req.method !== 'POST') {
-        var cc = req.accept.apply(req, keys)
-      } else {
-        var cc = req.headers['content-type']
-      }
+    var keys = Object.keys(self._byContentType).concat(['*/*'])
+    if (req.method !== 'PUT' && req.method !== 'POST') {
+      var cc = req.accept.apply(req, keys)
+    } else {
+      var cc = req.headers['content-type']
+    }
 
-      if (!cc) return returnEarly(req, resp, keys, authHandler)
-      if (cc === '*/*') {
-        var h = this.byContentType[Object.keys(this.byContentType)[0]]
-      } else {
-        var h = this.byContentType[cc]
-      }
-      if (!h) return returnEarly(req, resp, keys, authHandler)
-      if (resp._header) return // This response already started
-      resp.setHeader('content-type', cc)
+    if (!cc) return returnEarly(req, resp, keys, authHandler)
+    if (cc === '*/*') {
+      var h = this.byContentType[Object.keys(this.byContentType)[0]]
+    } else {
+      var h = this.byContentType[cc]
+    }
+    if (!h) return returnEarly(req, resp, keys, authHandler)
+    if (resp._header) return // This response already started
+    resp.setHeader('content-type', cc)
 
-      var run = function () {
-        if (h.request) {
-          return h.request(req, resp)
-        }
-        if (h.pipe) {
-          req.pipe(h)
-          h.pipe(resp)
-          return
-        }
-        h.call(req.route, req, resp)
+    var run = function () {
+      if (h.request) {
+        return h.request(req, resp)
       }
+      if (h.pipe) {
+        req.pipe(h)
+        h.pipe(resp)
+        return
+      }
+      h.call(req.route, req, resp)
+    }
 
-      if (authHandler) {
-        cap(req)
-        authHandler(req, resp, function (user) {
-          req.user = user
-          if (self._must && self._must.indexOf('auth') !== -1 && !req.user) {
-            if (resp._header) return // This response already started
-            resp.statusCode = 403
-            resp.setHeader('content-type', 'application/json')
-            resp.end(JSON.stringify({error: 'This resource requires auth.'}))
-            return
-          }
-          run()
-          req.release()
-        })
-      } else {
-        if (resp._header) return // This response already started
-        if (self._must && self._must.indexOf('auth') !== -1) {
+    if (authHandler) {
+      cap(req)
+      authHandler(req, resp, function (user) {
+        req.user = user
+        if (self._must && self._must.indexOf('auth') !== -1 && !req.user) {
+          if (resp._header) return // This response already started
           resp.statusCode = 403
           resp.setHeader('content-type', 'application/json')
           resp.end(JSON.stringify({error: 'This resource requires auth.'}))
           return
         }
         run()
-      }
-
+        req.release()
+      })
     } else {
-      returnEarly(req, resp, keys, authHandler)
+      if (resp._header) return // This response already started
+      if (self._must && self._must.indexOf('auth') !== -1) {
+        resp.statusCode = 403
+        resp.setHeader('content-type', 'application/json')
+        resp.end(JSON.stringify({error: 'This resource requires auth.'}))
+        return
+      }
+      run()
     }
+
   }
   application.emit('newroute', self)
 }
 util.inherits(Route, events.EventEmitter)
+
+
+// requests that should never SEND a request body to us
+var noBodyReqs = [ 'GET', 'HEAD', 'DELETE', 'TRACE', 'DELETE' ]
+
+// route.contentTypes('text/json', 'application/json', jsonUploadHandler)
+Route.prototype.contentTypes = function () {
+  var contentTypes = new Array(arguments.length)
+    , handler
+  for (var i = 0; i < contentTypes.length; i ++) {
+    contentTypes[i] = arguments[i]
+  }
+  if (typeof contentTypes[contentTypes.length-1] !== 'string') {
+    handler = makeHandler(contentTypes.pop())
+  }
+  if (!this._contentTypes) {
+    this._contentTypes = contentTypes
+  } else {
+    this._contentTypes = this._contentTypes.concat(contentTypes)
+  }
+
+  this.on('request', function (req, res) {
+    // not relevant for reqs where no body is present
+    if (noBodyReqs.indexOf(req) !== -1 || !req.contentLength) {
+      return
+    }
+
+    var ct = req.headers['content-type']
+    if (this._contentTypes.indexOf(ct) === -1) {
+      res.error(415)
+    }
+    if (handler && !req.handler && contentTypes.indexOf(ct) !== -1) {
+      req.handler = handler
+    }
+  })
+}
+
+Route.prototype.maxLength = function (n) {
+  if (typeof n !== 'number') {
+    throw new Error('please specify length in bytes for maxLength')
+  }
+  return this.on('request', function (req, res) {
+    var len = +(req.headers['content-length'])
+    if (isNaN(len)) return res.error(411)
+    if (len > n) return res.error(413)
+  })
+}
+
+// route.methods('POST', 'PUT', handler).methods('GET', 'HEAD', otherhandler)
+Route.prototype.methods = function () {
+  var handler
+    , methods = new Array(arguments.length)
+  for (var i = 0; i < methods.length; i ++) {
+    methods[i] = arguments[i]
+  }
+  if (typeof methods[methods.length-1] !== 'string') {
+    handler = makeHandler(methods.pop())
+  }
+
+  if (!this._methods) {
+    this._methods = methods
+  } else {
+    this._methods = this._methods.concat(methods)
+  }
+
+  return this.on('request', function (req, res) {
+    if (this._methods.indexOf(req.method) === -1) {
+      res.error(405)
+    }
+    if (handler && !req.handler && methods.indexOf(req.method) !== -1) {
+      req.handler = handler
+    }
+  })
+}
+
+// r.accepts('application/json', sendJson).accepts('text/html', sendHTML)
+Route.prototype.accepts = function () {
+  var accepts = new Array(arguments.length)
+  for (var i = 0; i < accepts.length; i ++) {
+    accepts[i] = arguments[i]
+  }
+  if (typeof accepts[accepts.length-1] !== 'string') {
+    handler = makeHandler(accepts.pop())
+  }
+
+  if (!this._accepts) {
+    this._accepts = accepts
+  } else {
+    this._accepts = this._accepts.concat(accepts)
+  }
+
+  return this.on('request', function (req, res) {
+    if (!req.accepts(this._accepts)) {
+      res.error(406)
+    }
+    if (handler && !req.handler && accepts.indexOf(req.method) !== -1) {
+      req.handler = handler
+    }
+  })
+}
+
+
 Route.prototype.json = function (cb) {
-  if (Buffer.isBuffer(cb)) cb = new BufferResponse(cb, 'application/json')
-  else if (typeof cb === 'object') cb = new BufferResponse(JSON.stringify(cb), 'application/json')
-  else if (typeof cb === 'string') {
-    if (cb[0] === '/') cb = filed(cb)
-    else cb = new BufferResponse(cb, 'application/json')
-  }
-  this.byContentType['application/json'] = cb
-  return this
+  return this.accepts('application/json', 'application/x-json', 'text/json', makeHandler(cb))
 }
+
+// Route.prototype.json = function (cb) {
+//   if (Buffer.isBuffer(cb)) cb = new BufferResponse(cb, 'application/json')
+//   else if (typeof cb === 'object') cb = new BufferResponse(JSON.stringify(cb), 'application/json')
+//   else if (typeof cb === 'string') {
+//     if (cb[0] === '/') cb = filed(cb)
+//     else cb = new BufferResponse(cb, 'application/json')
+//   }
+//   this.byContentType['application/json'] = cb
+//   return this
+// }
 Route.prototype.html = function (cb) {
-  if (Buffer.isBuffer(cb)) cb = new BufferResponse(cb, 'text/html')
-  else if (typeof cb === 'string') {
-    if (cb[0] === '/') cb = filed(cb)
-    else cb = new BufferResponse(cb, 'text/html')
-  }
-  this.byContentType['text/html'] = cb
-  return this
+  return this.accepts('text/html', '*/*', makeHandler(cb))
 }
-Route.prototype.text = function (cb) {
-  if (Buffer.isBuffer(cb)) cb = new BufferResponse(cb, 'text/plain')
-  else if (typeof cb === 'string') {
-    if (cb[0] === '/') cb = filed(cb)
-    else cb = new BufferResponse(cb, 'text/plain')
+
+// interpret cb as some sort of handler.
+//
+// route.json(function (req, res) { ... }) // you handle the json
+// route.json(404) // couldn't find your json.
+// route.json(410) // json is gone.  stop asking.
+// route.json({ok: true}) // jsonify
+// route.json('{"ok":true}') // return this exact json
+// route.json(new Buffer('{"ok":true}')) // return this exact json
+// route.json('/path/to/foo.json') // send this file
+// If none of these match, returns null, which means 'no handler'
+function makeHandler (cb) {
+  if (cb instanceof BufferResponse) {
+    // already a handler
+    return cb
   }
-  this.byContentType['text/plain'] = cb
-  return this
+
+  if (typeof cb === 'function') {
+    return cb.request = cb
+  }
+
+  if (typeof cb === 'number') {
+    return function (req, res) {
+      return res.error(cb)
+    }
+  }
+  if (Buffer.isBuffer(cb)) {
+    return new BufferResponse(cb, 'application/json')
+  }
+  if (typeof cb === 'object') {
+    return new BufferResponse(JSON.stringify(cb), 'application/json')
+  }
+  if (typeof cb === 'string') {
+    if (cb[0] === '/') return filed(cb)
+    return new BufferResponse(cb, 'application/json')
+  }
+  return null
+}
+
+Route.prototype.text = function (cb) {
+  return this.accepts('text/plain', '*/*', cb)
 }
 
 Route.prototype.file = function (filepath) {
-  this.on('request', function (req, resp) {
+  return this.on('request', function (req, resp) {
     var f = filed(filepath)
     req.pipe(f)
     f.pipe(resp)
   })
-  return this
 }
+
 Route.prototype.files = function (filepath) {
-  this.on('request', function (req, resp) {
+  return this.on('request', function (req, resp) {
     req.route.splats.unshift(filepath)
     var p = path.join.apply(path.join, req.route.splats)
     if (p.slice(0, filepath.length) !== filepath) {
@@ -743,97 +943,44 @@ Route.prototype.files = function (filepath) {
     req.pipe(f)
     f.pipe(resp)
   })
-  return this
 }
-Route.prototype.auth = function (handler) {
-  if (!handler) return this.authHandler
-  this.authHandler = handler
-  return this
+
+Route.prototype.auth = function () {
+  // if auth is not available, then do the login dance.
+  // auth could be implemented as either a plugin that does some IO,
+  // or as a simple basic auth handler.
+  return this.must('auth', 401)
 }
-Route.prototype.must = function () {
-  this._must = Array.prototype.slice.call(arguments)
-  return this
-}
-Route.prototype.methods = function () {
-  this._methods = Array.prototype.slice.call(arguments)
-  return this
+
+// list out the plugins that must successfully load.
+Route.prototype.must = function (thing, orelse) {
+  orelse = makeHandler(orelse || 400)
+  return this.on('request', function (req, res) {
+    // defer to 'request' event, since we don't know
+    // plugins might be added after the route is added
+    var when = 'pluginsDone'
+    if (this.app._plugins[thing]) {
+      when = 'plugin:' + thing
+    } else {
+      // not the name of a plugin.
+      // should be set by a request handler, before pluginsStart happens.
+      when = 'pluginsStart'
+    }
+    req.on(when, function () {
+      if (!req[thing]) req.handler = orelse
+    })
+  })
 }
 
 function ServiceError(msg) {
-  Error.apply(this, arguments)
-  this.message = msg 
-  this.stack = (new Error()).stack;
+  this.message = msg
+  if (Error.captureStackTrace) {
+    Error.captureStackTrace(this, ServiceError);
+  }
 }
-ServiceError.prototype = new Error()
+util.inherits(ServiceError, Error)
 ServiceError.prototype.constructor = ServiceError
 ServiceError.prototype.name = 'ServiceError'
+
 module.exports.ServiceError = ServiceError
-
-function Router (hosts, options) {
-  var self = this
-  self.hosts = hosts || {}
-  self.options = options || {}
-  
-  function makeHandler (type) {
-    var handler = function (req, resp) {
-      var host = req.headers.host
-      if (!host || !self.hosts[host]) {
-        if (!self._default) {
-          resp.writeHead(404, {'content-type':'text/plain'})
-          resp.end('No host header.')
-        } else {
-          self._default.httpServer.emit(type, req, resp)
-        }
-        return
-      }
-      self.hosts[host].httpServer.emit(type, req, resp)
-    }
-    return handler
-  }
-  
-  self.httpServer = http.createServer()
-  self.httpsServer = https.createServer(self.options.ssl || {})
-  
-  self.httpServer.on('request', makeHandler('request'))
-  self.httpsServer.on('request', makeHandler('request'))
-  
-  self.httpServer.on('upgrade', makeHandler('upgrade'))
-  self.httpsServer.on('upgrade', makeHandler('upgrade'))
-}
-Router.prototype.host = function (host, app) {
-  this.hosts[host] = app
-}
-Router.prototype.default = function (app) {
-  this._default = app
-}
-Router.prototype.close = function (cb) {
-  var counter = 1
-    , self = this
-    ;
-  function end () {
-    counter = counter - 1
-    if (counter === 0 && cb) cb()
-  }
-  if (self.httpServer._handle) {
-    counter++
-    self.httpServer.once('close', end)
-    self.httpServer.close()
-  }
-  if (self.httpsServer._handle) {
-    counter++
-    self.httpsServer.once('close', end)
-    self.httpsServer.close()
-  }
-  
-  for (i in self.hosts) {
-    counter++
-    process.nextTick(function () {
-      self.hosts[i].close(end)
-    })
-    
-  }
-  end()
-}
-
-module.exports.router = function (hosts) {return new Router(hosts)}
 
