@@ -130,7 +130,7 @@ t.httpServer.listen(8000, function () {
     if (e) throw e
     if (resp.statusCode !== 404) throw new Error('status code is not 404. '+resp.statusCode)
     assert.equal(resp.headers['content-type'], 'text/html')
-    assert.equal(body, '<html><body>Not Found</body></html>')
+    assert.equal(body, '<html><body>404 Not Found</body></html>')
     console.log('Passed html /404')
     end()
   })
@@ -140,7 +140,7 @@ t.httpServer.listen(8000, function () {
     if (e) throw e
     if (resp.statusCode !== 404) throw new Error('status code is not 404. '+resp.statusCode)
     assert.equal(resp.headers['content-type'], 'application/json')
-    assert.equal(body, "{\"status\":404,\"reason\":\"not found\",\"message\":\"not found\"}")
+    assert.equal(body, "{\"status\":404,\"message\":\"Not Found\"}")
     console.log('Passed json /404')
     end()
   })
@@ -150,7 +150,7 @@ t.httpServer.listen(8000, function () {
     if (e) throw e
     if (resp.statusCode !== 404) throw new Error('status code is not 404. '+resp.statusCode)
     assert.equal(resp.headers['content-type'], 'text/plain')
-    assert.equal(body, "Not Found")
+    assert.equal(body, "404 Not Found")
     console.log('Passed default text/plain /404')
     end()
   })

@@ -14,7 +14,7 @@ app.httpServer.listen(8080, function () {
   request.get(url+'nope', function (e, resp, body) {
     if (e) throw e
     assert.equal(resp.statusCode, 404)
-    assert.equal(body, 'Not Found')
+    assert.equal(body, '404 Not Found')
     
     // Make sure file serving works
     request.get(url+'dir/index.html', function (e, resp, body) {
@@ -24,6 +24,7 @@ app.httpServer.listen(8080, function () {
       assert.equal(body, index)
       
       // Set default 404
+      console.error('setting default 404 to '+path.join(__dirname, 'index.html'))
       app.notfound(path.join(__dirname, 'index.html'))
       
       // Test unfound route returns new default 404

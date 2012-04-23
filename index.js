@@ -18,7 +18,22 @@ var util = require('util')
   , io = null
   , Cookies = require('cookies')
   , Keygrip = require('keygrip')
+  , errSugars =
+    { bad: 400
+    , payment: 402
+    , forbidden: 403
+    , notfound: 404
+    , badmethod: 405
+    , badaccept: 406
+    , timeout: 408
+    , conflict: 409
+    , gone: 410
+    , needlength: 411
+    , toolarge: 413
+    , badtype: 415
+    }
   ;
+
 
 try {
   io = require('socket.io')
@@ -90,8 +105,7 @@ BufferResponse.prototype.request = function (req, resp) {
     return (resp._end ? resp._end : resp.end).call(resp)
   }
   resp.statusCode = this.statusCode || 200
-  ;(resp._write ? resp._write : resp.write).call(resp, this.body)
-  return (resp._end ? resp._end : resp.end).call(resp)
+  return resp.end(this.body)
 }
 
 function Page (templatename) {
@@ -288,7 +302,10 @@ function makeHandler (cb) {
     return new BufferResponse(JSON.stringify(cb), 'application/json')
   }
   if (typeof cb === 'string') {
-    if (cb[0] === '/') return filed(cb)
+    if (cb[0] === '/') {
+      console.error('%s looks like a path, use filed', cb)
+      return cb
+    }
     return new BufferResponse(cb)
   }
   return null
@@ -308,6 +325,32 @@ function Application (options) {
   }
 
   self._plugins = {}
+  self._errorHandlers = {}
+
+  // Set up some default error handlers.
+  Object.keys(errSugars).forEach(function (name) {
+    var code = errSugars[name]
+    self._errorHandlers[code] = function (req, resp) {
+      req.statusCode = code
+      var ct = req.accept('application/json', 'text/html', '*/*')
+        , message = http.STATUS_CODES[code]
+      switch (ct) {
+        case 'application/json':
+          resp.setHeader('content-type', 'application/json')
+          var obj = { status: code, message: message }
+          return resp.end(JSON.stringify(obj))
+        case 'text/html':
+          resp.setHeader('content-type', 'text/html')
+          return resp.end( '<html><body>'
+                         + code + ' ' + message
+                         + '</body></html>')
+        default:
+          resp.setHeader('content-type', 'text/plain')
+          return resp.end(code + ' ' + message)
+      }
+    }
+  })
+
 
   self.router = new routes.Router()
   self.on('newroute', function (route) {
@@ -383,7 +426,7 @@ Application.prototype._onRequest = function (req, resp) {
 
   self._decorate(req, resp)
 
-  if (!req.match) return self.notfound(req, resp)
+  if (!req.match) return resp.notfound()
 
   // attach the route handler
   req.match.fn(req, resp)
@@ -429,13 +472,22 @@ Application.prototype._onRequest = function (req, resp) {
 // apply the handler that is attached to the request.
 Application.prototype._applyHandler = function (req, resp) {
   var h = req.handler || req.route.handler
-  if (!h) return this.notfound(req, resp)
+  if (!h) return resp.notfound()
   if (h.request) {
     return h.request(req, resp)
   }
-  if (h.pipe) {
-    req.pipe(h)
+  if (typeof h === 'string') {
+    h = filed(h)
     h.pipe(resp)
+    req.pipe(h)
+    return
+  }
+  if (h.pipe) {
+    console.error('handler looks pipeable.', h)
+    h.pipe(resp)
+    console.error('piped to resp')
+    req.pipe(h)
+    console.error('piped from req')
     return
   }
   h.call(req.route, req, resp)
@@ -492,16 +544,25 @@ Application.prototype._decorate = function (req, resp) {
       err = {statusCode:err, message: http.STATUS_CODES[err]}
     }
     if (typeof(err) === "string") err = {message: err}
-    if (!err.statusCode) err.statusCode = 500
-    resp.statusCode = err.statusCode || 500
+    var code = err.statusCode = err.statusCode || err.code || 500
     self.logger.log('error %statusCode "%message "', err)
-    resp.end(err.message || err) // this should be better
+
+    var handler = self._errorHandlers[code]
+    req.error = err // confusing with resp.error() method?
+    resp.statusCode = code
+    if (!handler) {
+      resp.statusCode = code
+      resp.end(err.message || err) // this should be better
+    } else {
+      req.handler = handler
+      self._applyHandler(req, resp)
+    }
   }
 
-  resp.notfound = function (log) {
-    if (log) self.logger.log(log)
-    self.notfound(req, resp)
-  }
+  Object.keys(errSugars).forEach(function (name) {
+    var code = errSugars[name]
+    resp[name] = function () { return resp.error(code) }
+  })
 
   // Get all the parsed url properties on the request
   // This is the same style express uses and it's quite nice
@@ -525,18 +586,42 @@ Application.prototype._decorate = function (req, resp) {
   req.splats = req.match.splats
   req.src = req.match.route
 
-  // Fix for node's premature header check in end()
-  resp._end = resp.end
-  resp.end = function (chunk) {
-    if (resp.statusCode === 404 && self._notfound) {
-      return self._notfound.request(req, resp)
+  if (req.method === 'HEAD') {
+    // never send a body for HEAD requests.
+    resp.write = function () {}
+  }
+
+  // Hijack all errors which we know how to handle.
+  var origWrite = resp.write
+  resp.write = function (chunk) {
+    console.error('writing chunk', resp.statusCode, chunk)
+    if (resp._headerSent) {
+      console.error('header already sent', chunk)
+      // we're too late!
+      return chunk ? origWrite.call(resp, chunk) : true
     }
-    if (chunk) resp.write(chunk)
-    resp._end()
+    if ((resp.statusCode in self._errorHandlers) &&
+        req.handler !== self._errorHandlers[resp.statusCode]) {
+      // hijack the error
+      console.error('hijack handler')
+      req.handler = self._errorHandlers[resp.statusCode]
+      self._applyHandler(req, resp)
+      req._hijacked = true
+      return true
+    }
+    // unknown, or some other thing.
+    // just let it through.
+    return chunk ? origWrite.call(resp, chunk) : true
+  }
+
+  var origEnd = resp.end
+  resp.end = function (chunk) {
+    if (chunk) console.error('writing chunk', chunk)
+    resp.write(chunk)
+    if (!req._hijacked) origEnd.call(resp)
     self.logger.info('Response', resp.statusCode, req.url, resp._headerSent)
   }
 }
-
 
 
 Application.prototype.addHeader = function (name, value) {
@@ -545,7 +630,7 @@ Application.prototype.addHeader = function (name, value) {
 
 Application.prototype.route = function (path, cb) {
   var r = new Route(path, this)
-  if (cb) r.on('request', cb)
+  if (cb) r.default(cb)
   return r
 }
 Application.prototype.middle = function (mid) {
@@ -591,47 +676,20 @@ Application.prototype.close = function (cb) {
   return self
 }
 
-Application.prototype.notfound = function (req, resp) {
-  if (!resp) {
-    if (typeof req === "string") {
-      if (req[0] === '/') req = new BufferResponse(fs.readFileSync(req), 'text/html')
-      else req = new BufferResponse(req, 'text/html')
-    } else if (typeof req === "function") {
-      this._notfound = {}
-      this._notfound.request = function (r, resp) {
-        if (resp._write) resp.write = resp._write
-        if (resp._end) resp.end = resp._end
-        req(r, resp)
-      }
-      return
-    } else if (typeof req === 'object') {
-      req = new BufferResponse(JSON.stringify(req), 'application/json')
-    }
-    req.statusCode = 404
-    req.cache = false
-    this._notfound = req
-    return
-  }
-
-  if (resp._headerSent) return // This response already started
-
-  if (this._notfound) return this._notfound.request(req, resp)
-
-  var cc = req.accept('text/html', 'application/json', 'text/plain', '*/*') || 'text/plain'
-  if (cc === '*/*') {
-    cc = 'text/plain'
-  }
-  resp.statusCode = 404
-  resp.setHeader('content-type', cc)
-  if (cc === 'text/html') {
-    body = '<html><body>Not Found</body></html>'
-  } else if (cc === 'application/json') {
-    body = JSON.stringify({status:404, reason:'not found', message:'not found'})
-  } else {
-    body = 'Not Found'
-  }
-  resp.end(body)
+Application.prototype.error = function (code, handler) {
+  console.error('app.error', code, handler)
+  handler = makeHandler(handler)
+  this._errorHandlers[code] = handler
+  return this
 }
+
+Object.keys(errSugars).forEach(function (name) {
+  var code = errSugars[name]
+  Application.prototype[name] = function (cb) {
+    return this.error(code, cb)
+  }
+})
+
 
 Application.prototype.auth = function (handler) {
   if (!handler) return this.authHandler
@@ -710,7 +768,7 @@ function Route (path, application) {
 
   self.handler = function (req, resp) {
     // the default handler is just a 404
-    application.notfound(req, resp)
+    return resp.notfound()
   }
 
   application.emit('newroute', self)
@@ -720,6 +778,52 @@ util.inherits(Route, events.EventEmitter)
 
 Route.prototype.default = function (cb) {
   this.handler = makeHandler(cb)
+}
+
+Route.prototype.post = function (cb) {
+  return this.methods('POST', makeHandler(cb))
+}
+
+Route.prototype.get = function (cb) {
+  return this.methods('GET', makeHandler(cb))
+}
+
+Route.prototype.del = function (cb) {
+  return this.methods('DELETE', makeHandler(cb))
+}
+
+Route.prototype.put = function (cb) {
+  return this.methods('PUT', makeHandler(cb))
+}
+
+Route.prototype.methods = function () {
+  var methods = new Array(arguments.length)
+  for (var i = 0; i < methods.length; i ++) {
+    methods[i] = arguments[i]
+  }
+  if (typeof methods[methods.length-1] !== 'string') {
+    var handler = makeHandler(methods.pop())
+  }
+
+  this._methods = this._methods || []
+  this._methods = this._methods.concat(methods)
+
+  var self = this
+  return this.on('request', function (req, res) {
+    var meth = req.method
+
+    // treat HEAD the same as GET, since it is effectively
+    // the same as a bodiless GET response.
+    if (meth === 'HEAD') meth = 'GET'
+
+    if (self._methods.indexOf(meth) === -1) {
+      return res.badmethod()
+    }
+
+    if (handler && !req.handler && methods.indexOf(meth) !== -1) {
+      req.handler = handler
+    }
+  })
 }
 
 
@@ -741,7 +845,7 @@ Route.prototype.accepts = function () {
   return this.on('request', function (req, res) {
     var acc = req.accept(self._accepts.concat('*/*'))
     if (!acc) {
-      res.error(406)
+      res.badaccept()
     }
     if (handler && !req.handler &&
         (acc === '*/*' || accepts.indexOf(acc) !== -1)) {
